@@ -47,6 +47,11 @@ export const defaultCheckAction = {
     bet_size_in_BBs: 0
 }
 
+export const defaultCallAction = {
+    action_str: "call",
+    bet_size_in_BBs: 0
+}
+
 export const defaultFoldAction = {
     action_str: "fold",
     bet_size_in_BBs: 0

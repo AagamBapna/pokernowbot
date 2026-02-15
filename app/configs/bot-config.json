@@ -1,4 +1,4 @@
 {
     "debug_mode": 1,
-    "query_retries": 2 
+    "query_retries": 4 
 }

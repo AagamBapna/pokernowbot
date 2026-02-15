@@ -17,7 +17,11 @@ export class GoogleAIService extends AIService {
         ]
         this.model = this.agent.getGenerativeModel({ 
             model: this.getModelName(),
-            safetySettings
+            safetySettings,
+            generationConfig: {
+                temperature: 0.4,
+                maxOutputTokens: 150,
+            }
         });
     }
     

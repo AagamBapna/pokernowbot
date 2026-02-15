@@ -36,7 +36,9 @@ export class OpenAIService extends AIService {
         const processed_messages = this.processMessages(prev_messages);
         const completion = await this.agent.chat.completions.create({
             messages: processed_messages,
-            model: this.getModelName()
+            model: this.getModelName(),
+            temperature: 0.4,
+            max_tokens: 150,
         });
 
         const choice = completion.choices[0];

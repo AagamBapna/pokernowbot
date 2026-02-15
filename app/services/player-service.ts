@@ -21,15 +21,19 @@ export class PlayerService {
     async create(player_stats_JSON: any): Promise<void> {
         await this.db_service.query(
             `INSERT INTO PlayerStats
-             (name, total_hands, walks, vpip_hands, pfr_hands)
+             (name, total_hands, walks, vpip_hands, pfr_hands, three_bet_hands, three_bet_opportunities, total_bets_raises, total_calls)
              VALUES
-             (?, ?, ?, ?, ?)`,
+             (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
              [
                 player_stats_JSON.name, 
                 player_stats_JSON.total_hands, 
                 player_stats_JSON.walks, 
                 player_stats_JSON.vpip_hands,
-                player_stats_JSON.pfr_hands
+                player_stats_JSON.pfr_hands,
+                player_stats_JSON.three_bet_hands || 0,
+                player_stats_JSON.three_bet_opportunities || 0,
+                player_stats_JSON.total_bets_raises || 0,
+                player_stats_JSON.total_calls || 0
             ]
         )
     }
@@ -41,13 +45,21 @@ export class PlayerService {
                 total_hands = ?,
                 walks = ?,
                 vpip_hands = ?,
-                pfr_hands = ?
+                pfr_hands = ?,
+                three_bet_hands = ?,
+                three_bet_opportunities = ?,
+                total_bets_raises = ?,
+                total_calls = ?
              WHERE name = ?`,
              [
                 player_stats_JSON.total_hands, 
                 player_stats_JSON.walks, 
                 player_stats_JSON.vpip_hands,
                 player_stats_JSON.pfr_hands,
+                player_stats_JSON.three_bet_hands || 0,
+                player_stats_JSON.three_bet_opportunities || 0,
+                player_stats_JSON.total_bets_raises || 0,
+                player_stats_JSON.total_calls || 0,
                 player_name
             ]
         )

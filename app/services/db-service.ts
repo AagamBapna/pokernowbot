@@ -30,11 +30,33 @@ export class DBService {
                     vpip_hands INT NOT NULL,
                     vpip_stat REAL AS (vpip_hands / CAST((total_hands - walks) AS REAL)),
                     pfr_hands INT NOT NULL,
-                    pfr_stat REAL AS (pfr_hands / CAST((total_hands - walks) AS REAL))
+                    pfr_stat REAL AS (pfr_hands / CAST((total_hands - walks) AS REAL)),
+                    three_bet_hands INT NOT NULL DEFAULT 0,
+                    three_bet_opportunities INT NOT NULL DEFAULT 0,
+                    total_bets_raises INT NOT NULL DEFAULT 0,
+                    total_calls INT NOT NULL DEFAULT 0
                 );
             `);
+            // Migrate existing tables that don't have the new columns
+            await this.migratePlayerTable();
         } catch (err) {
             console.log("Failed to create player table", err.message);
+        }
+    }
+
+    async migratePlayerTable(): Promise<void> {
+        const columns_to_add = [
+            { name: 'three_bet_hands', type: 'INT NOT NULL DEFAULT 0' },
+            { name: 'three_bet_opportunities', type: 'INT NOT NULL DEFAULT 0' },
+            { name: 'total_bets_raises', type: 'INT NOT NULL DEFAULT 0' },
+            { name: 'total_calls', type: 'INT NOT NULL DEFAULT 0' },
+        ];
+        for (const col of columns_to_add) {
+            try {
+                await this.db.exec(`ALTER TABLE PlayerStats ADD COLUMN ${col.name} ${col.type}`);
+            } catch (err) {
+                // Column already exists, ignore
+            }
         }
     }
     

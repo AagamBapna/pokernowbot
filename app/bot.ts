@@ -3,7 +3,7 @@ import { ChatCompletionMessageParam } from "openai/resources/chat/completions.mj
 
 import { sleep } from './helpers/bot-helper.ts';
 
-import { AIService, BotAction, defaultCheckAction, defaultFoldAction } from './interfaces/ai-client-interfaces.ts';
+import { AIService, BotAction, defaultCheckAction, defaultCallAction, defaultFoldAction } from './interfaces/ai-client-interfaces.ts';
 import { ProcessedLogs } from './interfaces/log-processing-interfaces.ts';
 
 import { Game } from './models/game.ts';
@@ -14,6 +14,8 @@ import { PlayerService } from './services/player-service.ts';
 import { PuppeteerService } from './services/puppeteer-service.ts';
 
 import { constructQuery } from './helpers/construct-query-helper.ts';
+import { getGTOPreflopAction, analyzePreflopContext, normalizeHand } from './helpers/gto-preflop.ts';
+import { calculateEquity, parseRunout, getHandCategory, getPostflopGTOGuidance } from './helpers/equity-calculator.ts';
 
 import { DebugMode, logResponse } from './utils/error-handling-utils.ts';
 import { postProcessLogs, postProcessLogsAfterHand, preProcessLogs } from './utils/log-processing-utils.ts';
@@ -166,14 +168,23 @@ export class Bot {
 
                     // post process logs and construct query
                     await postProcessLogs(this.table.getLogsQueue(), this.game);
-                    const query = constructQuery(this.game);
-                    // query chatGPT and make action
+
                     try {
-                        const bot_action = await this.queryBotAction(query, this.query_retries);
+                        const street = this.table.getStreet();
+                        let bot_action: BotAction;
+
+                        if (!street || street === "" || street === "preflop") {
+                            // === PREFLOP: Use GTO engine (no LLM needed) ===
+                            bot_action = await this.getGTOPreflopDecision(hand);
+                        } else {
+                            // === POSTFLOP: Use equity-enhanced LLM ===
+                            bot_action = await this.getPostflopDecision(hand);
+                        }
+
                         this.table.resetPlayerActions();
                         await this.performBotAction(bot_action);
                     } catch (err) {
-                        console.log("Failed to query and perform bot action.")
+                        console.log("Failed to query and perform bot action:", err);
                     }
 
                     console.log("Waiting for bot's turn to end");
@@ -311,14 +322,163 @@ export class Bot {
         }
     }
 
+    /**
+     * GTO Preflop Decision - No LLM needed, instant and solver-accurate
+     */
+    private async getGTOPreflopDecision(hand: string[]): Promise<BotAction> {
+        const hero = this.game.getHero()!;
+        const heroId = hero.getPlayerId();
+        const heroPosition = this.table.getPlayerPositionFromId(heroId);
+        const stackBBs = hero.getStackSize();
+
+        // Build action context from player actions
+        const playerActions = this.table.getPlayerActions().map(a => ({
+            playerId: a.getPlayerId(),
+            action: a.getAction(),
+            betAmount: a.getBetAmount()
+        }));
+
+        const context = analyzePreflopContext(
+            playerActions, heroId, heroPosition, this.table.getPlayerPositions()
+        );
+
+        // Get opponent stats for exploitation
+        let opponentStats = null;
+        try {
+            if (context.openRaiserPosition) {
+                // Find the opener's name from position
+                for (const [id, pos] of this.table.getPlayerPositions().entries()) {
+                    if (pos === context.openRaiserPosition && id !== heroId) {
+                        const name = this.table.getNameFromId(id);
+                        opponentStats = this.table.getPlayerStatsFromName(name);
+                        break;
+                    }
+                }
+            }
+        } catch (e) { /* no stats available */ }
+
+        const gtoDecision = getGTOPreflopAction(
+            hand[0], hand[1], heroPosition, stackBBs, context, opponentStats
+        );
+
+        console.log(`\n=== GTO PREFLOP ENGINE ===`);
+        console.log(`Hand: ${normalizeHand(hand[0], hand[1])} | Position: ${heroPosition} | Stack: ${stackBBs.toFixed(1)} BB`);
+        console.log(`Context: RFI=${context.isRFI}, FacingOpen=${context.facingOpen}, Facing3Bet=${context.facing3Bet}`);
+        console.log(`Decision: ${gtoDecision.action} ${gtoDecision.sizingBBs.toFixed(1)} BB (confidence: ${(gtoDecision.confidence * 100).toFixed(0)}%)`);
+        console.log(`Reasoning: ${gtoDecision.reasoning}`);
+        console.log(`==========================\n`);
+
+        // If GTO engine is confident, use its decision directly
+        if (gtoDecision.confidence >= 0.6 && gtoDecision.action !== "") {
+            const botAction: BotAction = {
+                action_str: gtoDecision.action,
+                bet_size_in_BBs: gtoDecision.sizingBBs
+            };
+
+            // Validate the action is available in the UI
+            if (await this.isValidBotAction(botAction)) {
+                return botAction;
+            }
+
+            // If the GTO action isn't available (e.g., raise when only call/fold),
+            // try alternatives
+            console.log(`GTO action "${gtoDecision.action}" not available in UI, trying alternatives...`);
+
+            if (gtoDecision.action === "raise" || gtoDecision.action === "bet") {
+                // Can't raise, try call
+                const callAction: BotAction = { action_str: "call", bet_size_in_BBs: 0 };
+                if (await this.isValidBotAction(callAction)) return callAction;
+            }
+            if (gtoDecision.action === "call") {
+                // Can't call, try check
+                const checkAction: BotAction = { action_str: "check", bet_size_in_BBs: 0 };
+                if (await this.isValidBotAction(checkAction)) return checkAction;
+            }
+        }
+
+        // Low confidence or no decision: fall back to LLM
+        console.log("GTO engine deferred to LLM for this spot.");
+        return await this.getPostflopDecision(hand);
+    }
+
+    /**
+     * Postflop Decision - Equity-enhanced LLM query
+     */
+    private async getPostflopDecision(hand: string[]): Promise<BotAction> {
+        const hero = this.game.getHero()!;
+        const heroId = hero.getPlayerId();
+        const heroPosition = this.table.getPlayerPositionFromId(heroId);
+        const stackBBs = hero.getStackSize();
+        const potBBs = this.table.getPot();
+        const street = this.table.getStreet();
+        const runout = this.table.getRunout();
+        const numOpponents = this.table.getPlayersInPot() - 1;
+
+        // Calculate equity via Monte Carlo simulation
+        let equity = 50; // default
+        let equityCategory = "";
+        let gtoGuidance = "";
+
+        if (street && runout) {
+            try {
+                const boardCards = parseRunout(runout);
+                equity = calculateEquity(hand, boardCards, Math.max(numOpponents, 1), 1500);
+                equityCategory = getHandCategory(equity);
+
+                // Determine IP/OOP
+                const posOrder = ["SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO", "BU"];
+                const heroIdx = posOrder.indexOf(heroPosition);
+                let isIP = true;
+                for (const [id, pos] of this.table.getPlayerPositions().entries()) {
+                    if (id !== heroId) {
+                        const oppIdx = posOrder.indexOf(pos);
+                        if (oppIdx > heroIdx) { isIP = false; break; }
+                    }
+                }
+
+                gtoGuidance = getPostflopGTOGuidance(equity, potBBs, stackBBs, isIP, numOpponents);
+
+                console.log(`\n=== EQUITY CALCULATOR ===`);
+                console.log(`Hand: ${hand.join(", ")} | Board: ${runout} | Street: ${street}`);
+                console.log(`Equity: ${equity.toFixed(1)}% vs ${numOpponents} opponent(s)`);
+                console.log(`Category: ${equityCategory}`);
+                console.log(`GTO Guidance: ${gtoGuidance}`);
+                console.log(`=========================\n`);
+            } catch (err) {
+                console.log("Equity calculation failed, proceeding with LLM only:", err);
+            }
+        }
+
+        // Build enhanced query with equity data
+        const baseQuery = constructQuery(this.game);
+        let enhancedQuery = baseQuery;
+
+        if (equity !== 50 || equityCategory) {
+            enhancedQuery = baseQuery.replace(
+                /\nDecide your action/,
+                `\n--- EQUITY ANALYSIS ---\nYour estimated equity: ${equity.toFixed(1)}% against opponent range.\nHand category: ${equityCategory}\n${gtoGuidance}\n--- END EQUITY ANALYSIS ---\n\nDecide your action`
+            );
+        }
+
+        return await this.queryBotAction(enhancedQuery, this.query_retries);
+    }
+
     private async queryBotAction(query: string, retries: number, retry_counter: number = 0): Promise<BotAction> {
         if (retry_counter > retries) {
+            // Try check first, then call, then fold as last resort
             if (await this.isValidBotAction(defaultCheckAction)) {
-                console.log(`Failed to query bot action, exceeded the retry limit after ${retries} attempts. Defaulting to checking.`);
+                console.log(`Exceeded retry limit (${retries}). Defaulting to check.`);
                 return defaultCheckAction;
-            } else {
-                console.log(`Failed to query bot action, exceeded the retry limit after ${retries} attempts. Defaulting to folding.`);
+            } else if (await this.isValidBotAction(defaultCallAction)) {
+                console.log(`Exceeded retry limit (${retries}). Defaulting to call.`);
+                return defaultCallAction;
+            } else if (await this.isValidBotAction(defaultFoldAction)) {
+                console.log(`Exceeded retry limit (${retries}). Defaulting to fold.`);
                 return defaultFoldAction;
+            } else {
+                // Absolute last resort: check is safest
+                console.log(`Exceeded retry limit (${retries}). No valid action found, attempting check.`);
+                return defaultCheckAction;
             }
         }
         try {
@@ -370,20 +530,21 @@ export class Bot {
                     }
                     break;
                 case "call":
+                    // Call doesn't need a specific bet size from the AI - the UI handles the call amount
                     res = await this.puppeteer_service.waitForCallOption();
-                    if (res.code === "success" && bot_action.bet_size_in_BBs > 0 && bot_action.bet_size_in_BBs <= curr_stack_size_in_BBs) {
+                    if (res.code === "success") {
                         is_valid = true;
                     }
                     break;
                 case "check":
                     res = await this.puppeteer_service.waitForCheckOption();
-                    if (res.code === "success" && bot_action.bet_size_in_BBs == 0) {
+                    if (res.code === "success") {
                         is_valid = true;
                     }
                     break;
                 case "fold":
                     res = await this.puppeteer_service.waitForFoldOption();
-                    if (res.code === "success" && bot_action.bet_size_in_BBs == 0) {
+                    if (res.code === "success") {
                         is_valid = true;
                     }
                     break;

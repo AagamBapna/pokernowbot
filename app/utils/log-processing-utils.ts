@@ -68,18 +68,62 @@ export async function postProcessLogsAfterHand(logs: Array<Array<string>>, game:
     // 2 means they put in money through a raise. 1 -> vpip, 2 -> vpip & pfr
     // higher numbers override lower numbers
     let action_count = 0;
+    let preflop_raise_count = 0; // Track number of raises preflop for 3-bet detection
+    let is_preflop = true;
+
     for (const log of logs) {
+        // Detect street changes
+        if (log.length === 2 && Object.values<string>(Street).includes(log[0])) {
+            is_preflop = false;
+        }
+
         if (log.length > 3) {
             const player_id = log[0];
             const action = log[2];
             let action_num = 0;
+
             if (action === Action.CALL) {
                 action_num = 1;
                 action_count += 1;
+                // Track calls for aggression factor
+                try {
+                    const player_name = table.getNameFromId(player_id);
+                    const player_stats = table.getPlayerStatsFromName(player_name);
+                    player_stats.incrementCalls();
+                } catch (e) { /* player not found in cache */ }
             } else if (action === Action.BET || action === Action.RAISE) {
                 action_num = 2;
                 action_count += 1;
+                // Track bets/raises for aggression factor
+                try {
+                    const player_name = table.getNameFromId(player_id);
+                    const player_stats = table.getPlayerStatsFromName(player_name);
+                    player_stats.incrementBetsRaises();
+                } catch (e) { /* player not found in cache */ }
+
+                // Track 3-bet stats (preflop only)
+                if (is_preflop) {
+                    preflop_raise_count += 1;
+                    if (preflop_raise_count >= 2) {
+                        // This is a 3-bet (or 4-bet, etc.) - the player who did it gets credit
+                        try {
+                            const player_name = table.getNameFromId(player_id);
+                            const player_stats = table.getPlayerStatsFromName(player_name);
+                            player_stats.set3BetHands(player_stats.get3BetHands() + 1);
+                        } catch (e) { /* player not found in cache */ }
+                    }
+                }
             }
+
+            // Track 3-bet opportunities: any player who faces the first open raise has a 3-bet opportunity
+            if (is_preflop && preflop_raise_count === 1 && action !== Action.POST) {
+                try {
+                    const player_name = table.getNameFromId(player_id);
+                    const player_stats = table.getPlayerStatsFromName(player_name);
+                    player_stats.set3BetOpportunities(player_stats.get3BetOpportunities() + 1);
+                } catch (e) { /* player not found in cache */ }
+            }
+
             if (!table.existsInIdToActionNum(player_id) || table.getActionNumFromId(player_id)! < action_num) {
                 table.updateIdToActionNum(player_id, action_num);
             }
