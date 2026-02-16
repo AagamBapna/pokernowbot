@@ -172,8 +172,63 @@ const FACING_3BET_4BET_THRESHOLD = 96;  // 4-bet with: AA, KK, QQ, AKs
 const FACING_3BET_CALL_IP = 85;         // Call 3-bet IP: JJ+, AQs+, AKo, some suited connectors
 const FACING_3BET_CALL_OOP = 90;        // Call 3-bet OOP: QQ+, AKs, AQs
 
-// Short stack thresholds (< 25 BB)
-const SHORT_STACK_SHOVE_THRESHOLD = 65; // Shove with top ~35% of hands
+// Short stack thresholds (< 25 BB) - replaced by Nash push/fold ranges below
+const SHORT_STACK_SHOVE_THRESHOLD = 65; // Legacy fallback
+
+// ============================================================================
+// NASH PUSH/FOLD RANGES
+// ============================================================================
+
+// Maps (stack_bucket, position) -> minimum hand strength to shove
+const NASH_SHOVE_RANGES: Record<string, Record<string, number>> = {
+    "10": { // 10 BB
+        "UTG": 78, "UTG+1": 76, "MP": 74, "LJ": 72, "HJ": 70,
+        "CO": 62, "BU": 50, "SB": 48, "BB": 55,
+    },
+    "15": { // 15 BB
+        "UTG": 82, "UTG+1": 80, "MP": 78, "LJ": 76, "HJ": 74,
+        "CO": 68, "BU": 58, "SB": 55, "BB": 62,
+    },
+    "20": { // 20 BB
+        "UTG": 85, "UTG+1": 83, "MP": 82, "LJ": 80, "HJ": 78,
+        "CO": 72, "BU": 65, "SB": 62, "BB": 68,
+    },
+};
+
+// Call-vs-shove ranges (tighter than shove ranges)
+const NASH_CALL_VS_SHOVE: Record<string, Record<string, number>> = {
+    "10": {
+        "UTG": 88, "UTG+1": 87, "MP": 86, "LJ": 85, "HJ": 84,
+        "CO": 80, "BU": 75, "SB": 72, "BB": 68,
+    },
+    "15": {
+        "UTG": 90, "UTG+1": 89, "MP": 88, "LJ": 87, "HJ": 86,
+        "CO": 83, "BU": 78, "SB": 75, "BB": 72,
+    },
+    "20": {
+        "UTG": 92, "UTG+1": 91, "MP": 90, "LJ": 89, "HJ": 88,
+        "CO": 85, "BU": 82, "SB": 80, "BB": 76,
+    },
+};
+
+// ============================================================================
+// BB DEFENSE RANGES
+// ============================================================================
+
+// BB defense frequency depends on opener position
+const BB_DEFENSE_THRESHOLDS: Record<string, number> = {
+    "vs_UTG":   70, // Defend ~30% vs UTG (tight opener)
+    "vs_UTG+1": 68,
+    "vs_MP":    65,
+    "vs_LJ":    62,
+    "vs_HJ":    60,
+    "vs_CO":    55, // Defend ~45% vs CO
+    "vs_BU":    48, // Defend ~50%+ vs BU steal
+    "vs_SB":    45, // Defend widest vs SB
+};
+
+// BB check-raise range (subset of strong hands from BB)
+const BB_CHECK_RAISE_THRESHOLD = 88; // Top ~12% of hands for check-raise
 
 // ============================================================================
 // ACTION CONTEXT DETECTION
@@ -190,6 +245,20 @@ export interface PreflopContext {
     lastRaiseSize: number;    // Size of last raise in BBs
     potSize: number;          // Current pot in BBs
     isInPosition: boolean;    // Are we IP relative to the aggressor
+    playersInPot: number;     // Number of players already in the pot
+}
+
+// ============================================================================
+// MULTIWAY POT ADJUSTMENTS
+// ============================================================================
+
+/**
+ * Tighten ranges when multiple players are in the pot.
+ * Each extra player adds +5 to the threshold (requires stronger hand).
+ */
+export function getMultiwayAdjustment(playersInPot: number): number {
+    if (playersInPot <= 2) return 0;
+    return (playersInPot - 2) * 5;
 }
 
 export function analyzePreflopContext(
@@ -204,6 +273,7 @@ export function analyzePreflopContext(
     let potSize = 1.5; // SB + BB
     let heroActed = false;
     let facingLimp = false;
+    let playersInPot = 2; // SB + BB always in pot
 
     for (const action of playerActions) {
         if (action.playerId === heroId) {
@@ -219,6 +289,7 @@ export function analyzePreflopContext(
             potSize += action.betAmount;
         } else if (action.action === "calls") {
             potSize += action.betAmount;
+            playersInPot++;
             if (numRaises === 0) facingLimp = true;
         } else if (action.action === "posts") {
             // Blinds already counted
@@ -242,6 +313,7 @@ export function analyzePreflopContext(
         lastRaiseSize,
         potSize,
         isInPosition: isIP,
+        playersInPot,
     };
 }
 
@@ -255,6 +327,50 @@ interface ExploitAdjustment {
     callAdjust: number;      // Adjust calling range
     bluffMore: boolean;      // Should we bluff more vs this player?
     valueWider: boolean;     // Should we value bet wider?
+}
+
+/**
+ * Get exploitation adjustment based on opponent's positional stats.
+ * If we have enough data from their specific position, use that instead of overall stats.
+ */
+export function getPositionalExploitAdjustment(
+    stats: PlayerStats | null,
+    opponentPosition: string
+): ExploitAdjustment {
+    const defaults: ExploitAdjustment = {
+        rfiAdjust: 0, threeBetAdjust: 0, callAdjust: 0,
+        bluffMore: false, valueWider: false
+    };
+
+    if (!stats || stats.getTotalHands() < 8) return defaults;
+
+    // Check if we have positional stats with enough sample
+    const posVpip = stats.getPositionalVPIP(opponentPosition);
+    if (posVpip && posVpip.hands >= 5) {
+        const positionalVpipPct = (posVpip.vpip / posVpip.hands) * 100;
+        let adj = { ...defaults };
+
+        // If opponent opens much wider from this position than average
+        const overallVpip = stats.computeVPIPStat();
+        const deviation = positionalVpipPct - overallVpip;
+
+        if (deviation > 10) {
+            // They're much looser from this position
+            adj.threeBetAdjust = -5; // 3-bet wider for value
+            adj.callAdjust = -3;     // Call wider
+            adj.valueWider = true;
+        } else if (deviation < -10) {
+            // They're much tighter from this position
+            adj.rfiAdjust = -5;       // Steal wider
+            adj.threeBetAdjust = 5;   // Don't 3-bet light
+            adj.bluffMore = true;
+        }
+
+        return adj;
+    }
+
+    // Fall back to overall stats
+    return getExploitAdjustment(stats);
 }
 
 function getExploitAdjustment(stats: PlayerStats | null): ExploitAdjustment {
@@ -384,36 +500,52 @@ function getShortStackAction(
     hand: string, strength: number, position: string,
     stackBBs: number, context: PreflopContext
 ): GTODecision {
-    // Push/fold strategy
+    // Determine stack bucket for Nash ranges
+    let stackBucket: string;
+    if (stackBBs <= 12) stackBucket = "10";
+    else if (stackBBs <= 17) stackBucket = "15";
+    else stackBucket = "20";
+
+    // Push/fold strategy using Nash equilibrium ranges
     if (context.isRFI) {
-        // Open-shove threshold depends on position and stack
-        let threshold = SHORT_STACK_SHOVE_THRESHOLD;
-        if (position === "BU" || position === "SB") threshold -= 15;
-        if (position === "CO") threshold -= 8;
-        if (stackBBs < 15) threshold -= 10; // Shove wider with fewer BBs
+        const nashRanges = NASH_SHOVE_RANGES[stackBucket];
+        const threshold = nashRanges?.[position] ?? SHORT_STACK_SHOVE_THRESHOLD;
+
+        // For 20 BB, can open-raise instead of shove with premium hands
+        if (stackBucket === "20" && strength >= threshold + 10) {
+            return {
+                action: "raise", sizingBBs: 2.5, confidence: 0.9,
+                reasoning: `Short stack open-raise (20 BB): ${hand} (${strength}%) from ${position}, strong enough to raise/fold`
+            };
+        }
 
         if (strength >= threshold) {
             return {
                 action: "all-in", sizingBBs: stackBBs, confidence: 0.95,
-                reasoning: `Short stack push: ${hand} (${strength}th percentile) from ${position} with ${stackBBs.toFixed(0)} BB`
+                reasoning: `Nash shove: ${hand} (${strength}%) from ${position} with ${stackBBs.toFixed(0)} BB (threshold: ${threshold}%)`
             };
         }
-        return { action: "fold", sizingBBs: 0, confidence: 0.9, reasoning: `Short stack fold: ${hand} too weak to shove from ${position}` };
+        return { action: "fold", sizingBBs: 0, confidence: 0.9, reasoning: `Nash fold: ${hand} (${strength}%) below ${position} shove threshold (${threshold}%)` };
     }
 
     if (context.facingOpen) {
-        // 3-bet shove or fold
-        let threshold = 75;
-        if (context.isInPosition) threshold -= 5;
-        if (stackBBs < 15) threshold -= 8;
+        // 3-bet shove or fold using Nash call-vs-shove ranges
+        const nashCallRanges = NASH_CALL_VS_SHOVE[stackBucket];
+        let threshold = nashCallRanges?.[position] ?? 75;
+
+        // Adjust for position relative to opener
+        if (context.isInPosition) threshold -= 3;
+
+        // Multiway adjustment: tighter with more players in pot
+        threshold += getMultiwayAdjustment(context.playersInPot);
 
         if (strength >= threshold) {
             return {
                 action: "all-in", sizingBBs: stackBBs, confidence: 0.9,
-                reasoning: `Short stack reshove: ${hand} vs open from ${context.openRaiserPosition}`
+                reasoning: `Nash reshove: ${hand} (${strength}%) vs ${context.openRaiserPosition} open (threshold: ${threshold}%)`
             };
         }
-        return { action: "fold", sizingBBs: 0, confidence: 0.85, reasoning: `Short stack fold vs open: ${hand}` };
+        return { action: "fold", sizingBBs: 0, confidence: 0.85, reasoning: `Nash fold vs open: ${hand} (${strength}%) below reshove threshold` };
     }
 
     return { action: "fold", sizingBBs: 0, confidence: 0.7, reasoning: "Short stack default fold" };
@@ -430,8 +562,11 @@ function getRFIAction(
     let threshold = RFI_THRESHOLDS[position] ?? 75;
     threshold += exploit.rfiAdjust;
 
-    // Limp pot: raise wider to isolate
-    if (context.facingLimp) {
+    // Multiway: tighten ranges when limpers are in the pot
+    threshold += getMultiwayAdjustment(context.playersInPot);
+
+    // Limp pot: raise wider to isolate (but still adjusted for multiway)
+    if (context.facingLimp && context.playersInPot <= 3) {
         threshold -= 5;
     }
 
@@ -439,14 +574,14 @@ function getRFIAction(
         // Standard open size: 2.5 BB (add 1 per limper)
         let sizing = 2.5;
         if (context.facingLimp) {
-            sizing = 3.5; // Isolate raise
+            sizing = 3.5 + (context.playersInPot - 2) * 1.0; // Add 1 BB per limper
         }
         // SB opens slightly larger (OOP postflop)
         if (position === "SB") sizing = 3.0;
 
         return {
             action: "raise", sizingBBs: sizing, confidence: 0.9,
-            reasoning: `GTO open: ${hand} (${strength}%) from ${position}, threshold ${threshold}%`
+            reasoning: `GTO open: ${hand} (${strength}%) from ${position}, threshold ${threshold}%${context.playersInPot > 2 ? ` (multiway +${getMultiwayAdjustment(context.playersInPot)})` : ""}`
         };
     }
 
@@ -472,23 +607,30 @@ function getFacingOpenAction(
     const openerPos = context.openRaiserPosition;
     const vsKey = `vs_${openerPos}` as keyof typeof THREE_BET_VALUE_THRESHOLDS;
 
+    // Multiway adjustment: tighten 3-bet and call ranges with more players
+    const mwAdj = getMultiwayAdjustment(context.playersInPot);
+
     // 3-bet for VALUE
     let threeBetThreshold = THREE_BET_VALUE_THRESHOLDS[vsKey] ?? 92;
     threeBetThreshold += exploit.threeBetAdjust;
+    threeBetThreshold += mwAdj; // Tighter 3-bets in multiway
 
     if (strength >= threeBetThreshold) {
-        const sizing = context.isInPosition
+        let sizing = context.isInPosition
             ? context.lastRaiseSize * 3        // 3x IP
             : context.lastRaiseSize * 3.5;     // 3.5x OOP
+        // Increase 3-bet sizing in multiway pots
+        if (context.playersInPot > 2) {
+            sizing += (context.playersInPot - 2) * 1.5;
+        }
         return {
             action: "raise", sizingBBs: Math.max(sizing, 7), confidence: 0.9,
-            reasoning: `GTO 3-bet value: ${hand} (${strength}%) vs ${openerPos} open`
+            reasoning: `GTO 3-bet value: ${hand} (${strength}%) vs ${openerPos} open${mwAdj > 0 ? " (multiway tightened)" : ""}`
         };
     }
 
-    // 3-bet as BLUFF (suited aces, suited connectors)
-    if (THREE_BET_BLUFFS.includes(hand) && !exploit.valueWider) {
-        // Only 3-bet bluff some of the time (randomize ~40%)
+    // 3-bet as BLUFF (only in heads-up pots, not multiway)
+    if (THREE_BET_BLUFFS.includes(hand) && !exploit.valueWider && context.playersInPot <= 3) {
         if (Math.random() < 0.4) {
             const sizing = context.isInPosition
                 ? context.lastRaiseSize * 3
@@ -500,27 +642,81 @@ function getFacingOpenAction(
         }
     }
 
+    // BB DEFENSE: special handling for Big Blind
+    if (position === "BB") {
+        return getBBDefenseAction(hand, strength, context, exploit);
+    }
+
     // CALL (flat)
     let callThreshold: number;
-    if (position === "BB") {
-        callThreshold = CALL_VS_OPEN_THRESHOLDS["BB"];
-    } else if (context.isInPosition) {
+    if (context.isInPosition) {
         callThreshold = CALL_VS_OPEN_THRESHOLDS["IP"];
     } else {
         callThreshold = CALL_VS_OPEN_THRESHOLDS["OOP"];
     }
     callThreshold += exploit.callAdjust;
+    callThreshold += mwAdj; // Tighter calls in multiway
 
     if (strength >= callThreshold) {
         return {
             action: "call", sizingBBs: context.lastRaiseSize, confidence: 0.85,
-            reasoning: `GTO flat call: ${hand} (${strength}%) vs ${openerPos} open, ${context.isInPosition ? "IP" : "OOP"}`
+            reasoning: `GTO flat call: ${hand} (${strength}%) vs ${openerPos} open, ${context.isInPosition ? "IP" : "OOP"}${mwAdj > 0 ? " (multiway)" : ""}`
         };
     }
 
     return {
         action: "fold", sizingBBs: 0, confidence: 0.85,
         reasoning: `GTO fold vs open: ${hand} (${strength}%) too weak vs ${openerPos}`
+    };
+}
+
+// ============================================================================
+// BB DEFENSE
+// ============================================================================
+
+function getBBDefenseAction(
+    hand: string, strength: number,
+    context: PreflopContext, exploit: ExploitAdjustment
+): GTODecision {
+    const openerPos = context.openRaiserPosition;
+    const vsKey = `vs_${openerPos}`;
+
+    // BB-specific defense threshold based on opener position
+    let defenseThreshold = BB_DEFENSE_THRESHOLDS[vsKey] ?? 60;
+    defenseThreshold += exploit.callAdjust;
+
+    // Check-raise range from BB (strong hands that benefit from building the pot OOP)
+    const checkRaiseThreshold = BB_CHECK_RAISE_THRESHOLD + exploit.threeBetAdjust;
+    if (strength >= checkRaiseThreshold) {
+        const sizing = context.lastRaiseSize * 3.5;
+        return {
+            action: "raise", sizingBBs: Math.max(sizing, 7), confidence: 0.85,
+            reasoning: `BB 3-bet for value: ${hand} (${strength}%) vs ${openerPos} open (defense range)`
+        };
+    }
+
+    // 3-bet bluff from BB with suited hands that play well postflop
+    if (THREE_BET_BLUFFS.includes(hand) && context.playersInPot <= 3) {
+        if (Math.random() < 0.35) {
+            const sizing = context.lastRaiseSize * 3.5;
+            return {
+                action: "raise", sizingBBs: Math.max(sizing, 7), confidence: 0.7,
+                reasoning: `BB 3-bet bluff: ${hand} vs ${openerPos} open`
+            };
+        }
+    }
+
+    // Defend by calling with a wide range (already getting good pot odds)
+    if (strength >= defenseThreshold) {
+        return {
+            action: "call", sizingBBs: context.lastRaiseSize - 1, confidence: 0.8,
+            reasoning: `BB defense call: ${hand} (${strength}%) vs ${openerPos} open (threshold: ${defenseThreshold}%)`
+        };
+    }
+
+    return {
+        action: "fold", sizingBBs: 0, confidence: 0.8,
+        reasoning: `BB fold: ${hand} (${strength}%) too weak to defend vs ${openerPos}`
     };
 }
 

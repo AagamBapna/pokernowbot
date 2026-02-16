@@ -1,3 +1,8 @@
+export interface PositionalStat {
+    hands: number;
+    vpip: number;
+}
+
 export class PlayerStats {
     private player_name: string;
     private total_hands: number;
@@ -8,6 +13,7 @@ export class PlayerStats {
     private three_bet_opportunities: number;
     private total_bets_raises: number;
     private total_calls: number;
+    private position_vpip: Map<string, PositionalStat>;
 
     //TODO: player stats should use name not id
     //should have separate table mapping name to id in db that updates everytime new id is detected for particular name
@@ -22,6 +28,7 @@ export class PlayerStats {
             this.three_bet_opportunities = player_JSON.three_bet_opportunities || 0;
             this.total_bets_raises = player_JSON.total_bets_raises || 0;
             this.total_calls = player_JSON.total_calls || 0;
+            this.position_vpip = PlayerStats.deserializePositionVpip(player_JSON.position_vpip);
         } else {
             this.total_hands = 0;
             this.walks = 0;
@@ -31,7 +38,25 @@ export class PlayerStats {
             this.three_bet_opportunities = 0;
             this.total_bets_raises = 0;
             this.total_calls = 0;
+            this.position_vpip = new Map();
         }
+    }
+
+    private static deserializePositionVpip(data: any): Map<string, PositionalStat> {
+        const map = new Map<string, PositionalStat>();
+        if (!data) return map;
+        try {
+            const parsed = typeof data === "string" ? JSON.parse(data) : data;
+            if (typeof parsed === "object" && parsed !== null) {
+                for (const [pos, stat] of Object.entries(parsed)) {
+                    const s = stat as any;
+                    map.set(pos, { hands: s.hands || 0, vpip: s.vpip || 0 });
+                }
+            }
+        } catch {
+            // Invalid data, return empty map
+        }
+        return map;
     }
 
     public getName(): string {
@@ -132,6 +157,30 @@ export class PlayerStats {
         return this.total_bets_raises / this.total_calls;
     }
 
+    // Positional VPIP tracking
+    public incrementPositionalVPIP(position: string, isVpip: boolean): void {
+        const existing = this.position_vpip.get(position) || { hands: 0, vpip: 0 };
+        existing.hands += 1;
+        if (isVpip) existing.vpip += 1;
+        this.position_vpip.set(position, existing);
+    }
+
+    public getPositionalVPIP(position: string): PositionalStat | undefined {
+        return this.position_vpip.get(position);
+    }
+
+    public getAllPositionalVPIP(): Map<string, PositionalStat> {
+        return this.position_vpip;
+    }
+
+    public serializePositionVpip(): string {
+        const obj: Record<string, PositionalStat> = {};
+        for (const [pos, stat] of this.position_vpip.entries()) {
+            obj[pos] = stat;
+        }
+        return JSON.stringify(obj);
+    }
+
     public toJSON(): any {
         return {
             "name": this.player_name,
@@ -143,6 +192,7 @@ export class PlayerStats {
             "three_bet_opportunities": this.three_bet_opportunities,
             "total_bets_raises": this.total_bets_raises,
             "total_calls": this.total_calls,
+            "position_vpip": this.serializePositionVpip(),
         }
     }
 }

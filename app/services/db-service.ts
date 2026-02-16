@@ -50,6 +50,7 @@ export class DBService {
             { name: 'three_bet_opportunities', type: 'INT NOT NULL DEFAULT 0' },
             { name: 'total_bets_raises', type: 'INT NOT NULL DEFAULT 0' },
             { name: 'total_calls', type: 'INT NOT NULL DEFAULT 0' },
+            { name: 'position_vpip', type: "TEXT NOT NULL DEFAULT '{}'" },
         ];
         for (const col of columns_to_add) {
             try {

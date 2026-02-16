@@ -21,27 +21,28 @@ export class PlayerService {
     async create(player_stats_JSON: any): Promise<void> {
         await this.db_service.query(
             `INSERT INTO PlayerStats
-             (name, total_hands, walks, vpip_hands, pfr_hands, three_bet_hands, three_bet_opportunities, total_bets_raises, total_calls)
+             (name, total_hands, walks, vpip_hands, pfr_hands, three_bet_hands, three_bet_opportunities, total_bets_raises, total_calls, position_vpip)
              VALUES
-             (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
              [
-                player_stats_JSON.name, 
-                player_stats_JSON.total_hands, 
-                player_stats_JSON.walks, 
+                player_stats_JSON.name,
+                player_stats_JSON.total_hands,
+                player_stats_JSON.walks,
                 player_stats_JSON.vpip_hands,
                 player_stats_JSON.pfr_hands,
                 player_stats_JSON.three_bet_hands || 0,
                 player_stats_JSON.three_bet_opportunities || 0,
                 player_stats_JSON.total_bets_raises || 0,
-                player_stats_JSON.total_calls || 0
+                player_stats_JSON.total_calls || 0,
+                player_stats_JSON.position_vpip || '{}',
             ]
         )
     }
-    
+
     async update(player_name: string, player_stats_JSON: any): Promise<void> {
         await this.db_service.query(
             `UPDATE PlayerStats
-             SET 
+             SET
                 total_hands = ?,
                 walks = ?,
                 vpip_hands = ?,
@@ -49,17 +50,19 @@ export class PlayerService {
                 three_bet_hands = ?,
                 three_bet_opportunities = ?,
                 total_bets_raises = ?,
-                total_calls = ?
+                total_calls = ?,
+                position_vpip = ?
              WHERE name = ?`,
              [
-                player_stats_JSON.total_hands, 
-                player_stats_JSON.walks, 
+                player_stats_JSON.total_hands,
+                player_stats_JSON.walks,
                 player_stats_JSON.vpip_hands,
                 player_stats_JSON.pfr_hands,
                 player_stats_JSON.three_bet_hands || 0,
                 player_stats_JSON.three_bet_opportunities || 0,
                 player_stats_JSON.total_bets_raises || 0,
                 player_stats_JSON.total_calls || 0,
+                player_stats_JSON.position_vpip || '{}',
                 player_name
             ]
         )

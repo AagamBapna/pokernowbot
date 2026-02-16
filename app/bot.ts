@@ -14,8 +14,10 @@ import { PlayerService } from './services/player-service.ts';
 import { PuppeteerService } from './services/puppeteer-service.ts';
 
 import { constructQuery } from './helpers/construct-query-helper.ts';
-import { getGTOPreflopAction, analyzePreflopContext, normalizeHand } from './helpers/gto-preflop.ts';
-import { calculateEquity, parseRunout, getHandCategory, getPostflopGTOGuidance } from './helpers/equity-calculator.ts';
+import { getGTOPreflopAction, analyzePreflopContext, normalizeHand, getPositionalExploitAdjustment } from './helpers/gto-preflop.ts';
+import { calculateEquity, calculateEquityVsRange, parseRunout, getHandCategory, getPostflopGTOGuidance } from './helpers/equity-calculator.ts';
+import { RangeTracker } from './helpers/range-tracker.ts';
+import { getPostflopEVDecision } from './helpers/postflop-engine.ts';
 
 import { DebugMode, logResponse } from './utils/error-handling-utils.ts';
 import { postProcessLogs, postProcessLogsAfterHand, preProcessLogs } from './utils/log-processing-utils.ts';
@@ -38,6 +40,7 @@ export class Bot {
     private table!: Table;
     private game!: Game;
     private bot_name!: string;
+    private range_tracker: RangeTracker;
 
     constructor(log_service: LogService, 
                 ai_service: AIService,
@@ -58,6 +61,7 @@ export class Bot {
 
         this.first_created = "";
         this.hand_history = [];
+        this.range_tracker = new RangeTracker();
     }
 
     public async run() {
@@ -74,6 +78,7 @@ export class Bot {
             this.table.setPlayersInPot(this.table.getNumPlayers());
             await this.playOneHand();
             this.hand_history = [];
+            this.range_tracker.reset();
             this.table.nextHand();
         }
     }
@@ -402,7 +407,60 @@ export class Bot {
     }
 
     /**
-     * Postflop Decision - Equity-enhanced LLM query
+     * Initialize range tracking for opponents in the current hand.
+     */
+    private initializeRangeTracking(): void {
+        const heroId = this.game.getHero()?.getPlayerId();
+        if (!heroId) return;
+
+        for (const [id, pos] of this.table.getPlayerPositions().entries()) {
+            if (id === heroId) continue;
+            try {
+                const name = this.table.getNameFromId(id);
+                const stats = this.table.getPlayerStatsFromName(name);
+                this.range_tracker.initRange(id, pos, stats);
+            } catch {
+                this.range_tracker.initFullRange(id);
+            }
+        }
+    }
+
+    /**
+     * Update opponent ranges based on observed actions.
+     */
+    private updateRangesFromActions(): void {
+        const heroId = this.game.getHero()?.getPlayerId();
+        if (!heroId) return;
+        const street = this.table.getStreet() || "preflop";
+        const potBBs = this.table.getPot();
+
+        for (const action of this.table.getPlayerActions()) {
+            const playerId = action.getPlayerId();
+            if (playerId === heroId) continue;
+
+            let stats = null;
+            let position = "";
+            try {
+                const name = this.table.getNameFromId(playerId);
+                stats = this.table.getPlayerStatsFromName(name);
+                position = this.table.getPlayerPositionFromId(playerId);
+            } catch { /* no stats */ }
+
+            const betFraction = potBBs > 0 ? action.getBetAmount() / potBBs : 0.5;
+            const posOrder = ["SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO", "BU"];
+            const heroIdx = posOrder.indexOf(this.table.getPlayerPositionFromId(heroId));
+            const oppIdx = posOrder.indexOf(position);
+            const isIP = oppIdx > heroIdx;
+
+            this.range_tracker.applyAction(
+                playerId, action.getAction(), position, stats,
+                street, betFraction, isIP
+            );
+        }
+    }
+
+    /**
+     * Postflop Decision - EV-based engine with LLM tiebreaker
      */
     private async getPostflopDecision(hand: string[]): Promise<BotAction> {
         const hero = this.game.getHero()!;
@@ -414,51 +472,133 @@ export class Bot {
         const runout = this.table.getRunout();
         const numOpponents = this.table.getPlayersInPot() - 1;
 
+        // Initialize and update range tracking
+        if (this.range_tracker.getRange(heroId) === undefined) {
+            this.initializeRangeTracking();
+        }
+        this.updateRangesFromActions();
+
         // Calculate equity via Monte Carlo simulation
         let equity = 50; // default
         let equityCategory = "";
         let gtoGuidance = "";
+        let rangeDescription = "";
+
+        // Determine IP/OOP
+        const posOrder = ["SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO", "BU"];
+        const heroIdx = posOrder.indexOf(heroPosition);
+        let isIP = true;
+        for (const [id, pos] of this.table.getPlayerPositions().entries()) {
+            if (id !== heroId) {
+                const oppIdx = posOrder.indexOf(pos);
+                if (oppIdx > heroIdx) { isIP = false; break; }
+            }
+        }
 
         if (street && runout) {
             try {
                 const boardCards = parseRunout(runout);
-                equity = calculateEquity(hand, boardCards, Math.max(numOpponents, 1), 1500);
-                equityCategory = getHandCategory(equity);
 
-                // Determine IP/OOP
-                const posOrder = ["SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO", "BU"];
-                const heroIdx = posOrder.indexOf(heroPosition);
-                let isIP = true;
-                for (const [id, pos] of this.table.getPlayerPositions().entries()) {
-                    if (id !== heroId) {
-                        const oppIdx = posOrder.indexOf(pos);
-                        if (oppIdx > heroIdx) { isIP = false; break; }
+                // Try range-aware equity first, fall back to random
+                let usedRange = false;
+                for (const [id, _pos] of this.table.getPlayerPositions().entries()) {
+                    if (id === heroId) continue;
+                    const oppRange = this.range_tracker.getRange(id);
+                    if (oppRange) {
+                        equity = calculateEquityVsRange(hand, boardCards, oppRange, 1500);
+                        rangeDescription = this.range_tracker.describeRange(id);
+                        usedRange = true;
+                        break; // Use primary opponent's range
                     }
                 }
+                if (!usedRange) {
+                    equity = calculateEquity(hand, boardCards, Math.max(numOpponents, 1), 1500);
+                }
 
+                equityCategory = getHandCategory(equity);
                 gtoGuidance = getPostflopGTOGuidance(equity, potBBs, stackBBs, isIP, numOpponents);
 
                 console.log(`\n=== EQUITY CALCULATOR ===`);
                 console.log(`Hand: ${hand.join(", ")} | Board: ${runout} | Street: ${street}`);
-                console.log(`Equity: ${equity.toFixed(1)}% vs ${numOpponents} opponent(s)`);
+                console.log(`Equity: ${equity.toFixed(1)}% vs ${numOpponents} opponent(s)${usedRange ? " (range-aware)" : " (random)"}`);
+                if (rangeDescription) console.log(`Opponent range: ${rangeDescription}`);
                 console.log(`Category: ${equityCategory}`);
                 console.log(`GTO Guidance: ${gtoGuidance}`);
                 console.log(`=========================\n`);
             } catch (err) {
-                console.log("Equity calculation failed, proceeding with LLM only:", err);
+                console.log("Equity calculation failed, proceeding with defaults:", err);
             }
         }
 
-        // Build enhanced query with equity data
+        // === EV-BASED POSTFLOP ENGINE ===
+        // Determine if we're facing a bet
+        let facingBet = false;
+        let betToCallBBs = 0;
+        let opponentStats: import("./models/player-stats.ts").PlayerStats | null = null;
+        const playerActions = this.table.getPlayerActions();
+
+        for (let i = playerActions.length - 1; i >= 0; i--) {
+            const act = playerActions[i];
+            if (act.getPlayerId() !== heroId) {
+                const actionStr = act.getAction();
+                if (actionStr === "bets" || actionStr === "raises") {
+                    facingBet = true;
+                    betToCallBBs = act.getBetAmount();
+                    try {
+                        const name = this.table.getNameFromId(act.getPlayerId());
+                        opponentStats = this.table.getPlayerStatsFromName(name);
+                    } catch { /* no stats */ }
+                    break;
+                }
+            }
+        }
+
+        const canBet = await this.puppeteer_service.waitForBetOption().then(r => r.code === "success").catch(() => false);
+        const canCheck = !facingBet;
+
+        const evDecision = getPostflopEVDecision(
+            equity, potBBs, stackBBs, street || "flop",
+            facingBet, betToCallBBs, opponentStats,
+            canCheck, canBet
+        );
+
+        console.log(`\n=== POSTFLOP EV ENGINE ===`);
+        console.log(`Best action: ${evDecision.action} ${evDecision.sizingBBs.toFixed(1)} BB`);
+        console.log(`EV: ${evDecision.evBBs.toFixed(2)} BB | Confidence: ${(evDecision.confidence * 100).toFixed(0)}%`);
+        console.log(`${evDecision.reasoning}`);
+        console.log(`==========================\n`);
+
+        // If EV engine is highly confident (large gap between top actions), use it directly
+        if (evDecision.confidence >= 0.6) {
+            const botAction: BotAction = {
+                action_str: evDecision.action,
+                bet_size_in_BBs: evDecision.sizingBBs
+            };
+            if (await this.isValidBotAction(botAction)) {
+                console.log("Using EV engine decision directly (high confidence).");
+                return botAction;
+            }
+        }
+
+        // Low confidence or invalid action: fall back to LLM as tiebreaker
+        console.log("EV engine confidence low, using LLM as tiebreaker.");
+
+        // Build enhanced query with equity + EV data + range info
         const baseQuery = constructQuery(this.game);
         let enhancedQuery = baseQuery;
 
-        if (equity !== 50 || equityCategory) {
-            enhancedQuery = baseQuery.replace(
-                /\nDecide your action/,
-                `\n--- EQUITY ANALYSIS ---\nYour estimated equity: ${equity.toFixed(1)}% against opponent range.\nHand category: ${equityCategory}\n${gtoGuidance}\n--- END EQUITY ANALYSIS ---\n\nDecide your action`
-            );
-        }
+        const evInfo = `\n--- ANALYSIS ---\n` +
+            `Your estimated equity: ${equity.toFixed(1)}% against opponent range.\n` +
+            `Hand category: ${equityCategory}\n` +
+            (rangeDescription ? `Opponent likely holds: ${rangeDescription}\n` : "") +
+            `${gtoGuidance}\n` +
+            `EV Engine suggestion: ${evDecision.action} ${evDecision.sizingBBs.toFixed(1)} BB (EV: ${evDecision.evBBs.toFixed(2)} BB)\n` +
+            `--- END ANALYSIS ---\n`;
+
+        enhancedQuery = baseQuery.replace(
+            /\nDecide your action/,
+            `${evInfo}\nDecide your action`
+        );
 
         return await this.queryBotAction(enhancedQuery, this.query_retries);
     }

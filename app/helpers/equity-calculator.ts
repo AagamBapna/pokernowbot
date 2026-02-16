@@ -7,6 +7,7 @@
 
 // @ts-ignore
 import { rankBoard } from "phe";
+import { WeightedHand, normalizeRange, expandHandToCombos } from "./range-tracker.ts";
 
 const RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"];
 const SUITS = ["s", "h", "d", "c"];
@@ -152,6 +153,101 @@ export function calculateEquity(
 
     const equity = ((wins + ties * 0.5) / numSimulations) * 100;
     return equity;
+}
+
+/**
+ * Monte Carlo equity calculation against a weighted opponent range.
+ *
+ * Instead of dealing random opponent cards, samples opponent hands
+ * from the weighted range distribution for more accurate equity.
+ *
+ * @param heroCards - Hero's hole cards (2 cards)
+ * @param boardCards - Community cards shown so far (0-5 cards)
+ * @param opponentRange - Weighted range of opponent's possible holdings
+ * @param numSimulations - Number of random simulations to run
+ * @returns Equity as a percentage (0-100)
+ */
+export function calculateEquityVsRange(
+    heroCards: string[],
+    boardCards: string[],
+    opponentRange: WeightedHand[],
+    numSimulations: number = 2000
+): number {
+    const heroNorm = heroCards.map(normalizeCard);
+    const boardNorm = boardCards.map(normalizeCard);
+    const usedCards = new Set([...heroNorm, ...boardNorm]);
+
+    // Build weighted combo list from opponent range
+    const normalized = normalizeRange(opponentRange);
+    const weightedCombos: { cards: [string, string]; weight: number }[] = [];
+
+    for (const wh of normalized) {
+        if (wh.weight < 0.001) continue;
+        const combos = expandHandToCombos(wh.hand);
+        for (const combo of combos) {
+            // Skip combos that conflict with known cards
+            if (usedCards.has(combo[0]) || usedCards.has(combo[1])) continue;
+            weightedCombos.push({ cards: combo, weight: wh.weight });
+        }
+    }
+
+    if (weightedCombos.length === 0) {
+        // Fallback to random equity if range produces no valid combos
+        return calculateEquity(heroCards, boardCards, 1, numSimulations);
+    }
+
+    // Build cumulative weight array for weighted sampling
+    const totalWeight = weightedCombos.reduce((sum, c) => sum + c.weight, 0);
+    const cumulativeWeights: number[] = [];
+    let cumSum = 0;
+    for (const combo of weightedCombos) {
+        cumSum += combo.weight / totalWeight;
+        cumulativeWeights.push(cumSum);
+    }
+
+    const cardsNeededForBoard = 5 - boardNorm.length;
+    const fullDeck = buildDeck();
+
+    let wins = 0;
+    let ties = 0;
+
+    for (let sim = 0; sim < numSimulations; sim++) {
+        // Sample opponent hand from weighted range
+        const r = Math.random();
+        let comboIdx = 0;
+        for (let i = 0; i < cumulativeWeights.length; i++) {
+            if (r <= cumulativeWeights[i]) {
+                comboIdx = i;
+                break;
+            }
+            comboIdx = i;
+        }
+        const oppCards = weightedCombos[comboIdx].cards;
+
+        // Build remaining deck excluding hero, board, and opponent cards
+        const excluded = new Set([...heroNorm, ...boardNorm, oppCards[0], oppCards[1]]);
+        const remainingDeck = fullDeck.filter(c => !excluded.has(c));
+
+        if (remainingDeck.length < cardsNeededForBoard) continue;
+
+        // Shuffle and complete board
+        shuffle(remainingDeck);
+        const fullBoard = [...boardNorm];
+        for (let i = 0; i < cardsNeededForBoard; i++) {
+            fullBoard.push(remainingDeck[i]);
+        }
+
+        const heroRank = evaluateHand([...heroNorm, ...fullBoard]);
+        const oppRank = evaluateHand([oppCards[0], oppCards[1], ...fullBoard]);
+
+        if (heroRank < oppRank) {
+            wins++;
+        } else if (heroRank === oppRank) {
+            ties++;
+        }
+    }
+
+    return ((wins + ties * 0.5) / numSimulations) * 100;
 }
 
 /**

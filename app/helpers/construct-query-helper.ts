@@ -3,8 +3,9 @@ import { rankBoard } from "phe";
 import { Game } from "../models/game.ts";
 import { PlayerAction } from "../models/player-action.ts";
 import { Table } from "../models/table.ts";
+import { RangeTracker } from "./range-tracker.ts";
 
-export function constructQuery(game: Game): string{
+export function constructQuery(game: Game, rangeTracker?: RangeTracker): string{
     const table = game.getTable();
 
     const street = table.getStreet();
@@ -27,6 +28,9 @@ export function constructQuery(game: Game): string{
     query = query.concat(defineObjective(hero_position, hero_stack), '\n');
     query = query.concat(defineGameState(street, players_in_pot, table.getNumPlayers()), '\n');
     query = query.concat(defineCommunityCards(street, runout), '\n');
+    if (street && runout) {
+        query = query.concat(defineBoardTexture(runout), '\n');
+    }
     query = query.concat(defineHand(hero_cards), '\n');
     const rank_query = defineRank(street, runout, hero_cards);
     query = query.concat(rank_query ? rank_query + '\n' : '');
@@ -39,6 +43,9 @@ export function constructQuery(game: Game): string{
     query = query.concat(definePotOdds(player_actions, pot_size), '\n');
     query = query.concat(definePositionContext(hero_position, player_actions, player_positions, table, hero_id), '\n');
     query = query.concat(defineStats(player_positions, table, hero_name), '\n');
+    if (rangeTracker) {
+        query = query.concat(defineOpponentRanges(player_positions, table, hero_id, rangeTracker), '\n');
+    }
     query = query.concat(defineOutput());
 
     return query;
@@ -339,6 +346,95 @@ function defineStats(player_positions: Map<string, string>, table: Table, hero_n
     
     if (!has_stats) {
         query = query.concat("  No opponent data available.");
+    }
+    return query;
+}
+
+function defineBoardTexture(runout: string): string {
+    const cards = convertRunoutToCards(runout);
+    if (cards.length === 0) return "";
+
+    const descriptors: string[] = [];
+
+    // Check for paired board
+    const values = cards.map(c => {
+        let v = c.slice(0, -1);
+        if (v === "10") v = "T";
+        return v;
+    });
+    const valueCounts = new Map<string, number>();
+    for (const v of values) {
+        valueCounts.set(v, (valueCounts.get(v) || 0) + 1);
+    }
+    const hasPair = [...valueCounts.values()].some(c => c >= 2);
+    if (hasPair) descriptors.push("paired");
+
+    // Check for flush draws / monotone
+    const suits = cards.map(c => c.slice(-1));
+    const suitCounts = new Map<string, number>();
+    for (const s of suits) {
+        suitCounts.set(s, (suitCounts.get(s) || 0) + 1);
+    }
+    const maxSuitCount = Math.max(...suitCounts.values());
+    if (maxSuitCount >= 3) {
+        descriptors.push("monotone (flush possible)");
+    } else if (maxSuitCount === 2 && cards.length <= 3) {
+        descriptors.push("two-tone (flush draw possible)");
+    } else if (cards.length <= 3) {
+        descriptors.push("rainbow (no flush draw)");
+    }
+
+    // Check for connectedness (straight draws)
+    const valueOrder = "23456789TJQKA";
+    const indices = [...new Set(values.map(v => valueOrder.indexOf(v)))].filter(i => i >= 0).sort((a, b) => a - b);
+    if (indices.length >= 3) {
+        const range = indices[indices.length - 1] - indices[0];
+        if (range <= 4) {
+            descriptors.push("connected (straight draws likely)");
+        } else if (range <= 6) {
+            descriptors.push("semi-connected");
+        } else {
+            descriptors.push("disconnected");
+        }
+    }
+
+    // High card check
+    const highCards = values.filter(v => "TJQKA".includes(v));
+    if (highCards.length >= 2) {
+        descriptors.push("high-card heavy");
+    } else if (highCards.length === 0) {
+        descriptors.push("low board");
+    }
+
+    const texture = descriptors.length > 0 ? descriptors.join(", ") : "neutral";
+    const dynamicStatic = (maxSuitCount >= 2 && indices.length >= 3 && (indices[indices.length - 1] - indices[0]) <= 5)
+        ? "wet/dynamic (many draws possible - bet larger to deny equity)"
+        : "dry/static (few draws - can bet smaller for value)";
+
+    return `Board texture: ${texture}. Overall: ${dynamicStatic}.`;
+}
+
+function defineOpponentRanges(
+    player_positions: Map<string, string>,
+    table: Table,
+    hero_id: string,
+    rangeTracker: RangeTracker
+): string {
+    let query = "Opponent range estimates (based on actions this hand):\n";
+    let hasRanges = false;
+
+    for (const [playerId, _pos] of player_positions.entries()) {
+        if (playerId === hero_id) continue;
+        const rangeDesc = rangeTracker.describeRange(playerId);
+        if (rangeDesc && !rangeDesc.includes("no tracking data")) {
+            const pos = table.getPlayerPositionFromId(playerId);
+            query += `  ${pos}: ${rangeDesc}\n`;
+            hasRanges = true;
+        }
+    }
+
+    if (!hasRanges) {
+        return "";
     }
     return query;
 }

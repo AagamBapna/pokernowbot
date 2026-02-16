@@ -62,6 +62,10 @@ export function getPromptFromPlaystyle(playstyle: string) {
 }
 
 export function parseResponse(msg: string): BotAction {
+    // Try structured JSON parsing first
+    const jsonAction = tryParseJSON(msg);
+    if (jsonAction) return jsonAction;
+
     msg = processOutput(msg);
 
     if (!msg) {
@@ -70,7 +74,7 @@ export function parseResponse(msg: string): BotAction {
             bet_size_in_BBs: 0
         }
     }
-    
+
     // Match actions with priority: all-in first (since it contains "all" which could conflict)
     const all_in_match = msg.match(/all[\s\-_]?in/i);
     if (all_in_match) {
@@ -107,6 +111,33 @@ export function parseResponse(msg: string): BotAction {
     return {
         action_str: action_str,
         bet_size_in_BBs: bet_size_in_BBs
+    }
+}
+
+/**
+ * Try to parse a structured JSON response from the LLM.
+ * Supports format: {"action": "raise", "size": 7.5}
+ */
+function tryParseJSON(msg: string): BotAction | null {
+    try {
+        // Look for JSON object in the message
+        const jsonMatch = msg.match(/\{[\s\S]*"action"[\s\S]*\}/);
+        if (!jsonMatch) return null;
+
+        const parsed = JSON.parse(jsonMatch[0]);
+        const validActions = ["fold", "check", "call", "bet", "raise", "all-in"];
+
+        let action = (parsed.action || "").toLowerCase().trim();
+        if (action === "allin" || action === "all_in") action = "all-in";
+        if (!validActions.includes(action)) return null;
+
+        let size = parseFloat(parsed.size || parsed.bet_size_in_BBs || parsed.sizing || 0);
+        if (isNaN(size)) size = 0;
+        if (action === "check" || action === "fold") size = 0;
+
+        return { action_str: action, bet_size_in_BBs: size };
+    } catch {
+        return null;
     }
 }
 
